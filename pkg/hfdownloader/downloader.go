@@ -226,7 +226,14 @@ LOOP:
 		}
 
 		wg.Add(1)
-			   go func() {
+			       go func() {
+				       defer func() {
+					       if r := recover(); r != nil {
+						       emit(ProgressEvent{Event: "debug", Path: it.RelativePath, Message: "debug: PANIC in file goroutine: " + fmt.Sprint(r)})
+					       } else {
+						       emit(ProgressEvent{Event: "debug", Path: it.RelativePath, Message: "debug: file goroutine exited cleanly"})
+					       }
+				       }()
 								   // Emit debug log at the start of each file processing
 								   emit(ProgressEvent{Event: "debug", Path: it.RelativePath, Message: "debug: starting file processing (index=" + fmt.Sprint(idx) + ", name=" + it.RelativePath + ")"})
 			defer wg.Done()
@@ -243,7 +250,7 @@ LOOP:
 				finalRel = filepath.ToSlash(filepath.Join(it.Subdir, it.RelativePath))
 			}
 
-			       if !useHFCache && cfg.NoRepoSubdir {
+					   if !useHFCache && cfg.NoRepoSubdir {
 				       mappedRel, skip := mapFlatNoRepoFile(job.Repo, finalRel)
 				       if skip {
 					       if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
@@ -251,7 +258,8 @@ LOOP:
 						       atomic.AddInt64(&skippedCount, 1)
 					       }
 					       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: file skipped (ignored in flat mode)"})
-					       return
+									   emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: goroutine returning after skip (ignored in flat mode)"})
+									   return
 				       }
 				       finalRel = mappedRel
 			       }
@@ -299,27 +307,29 @@ LOOP:
 				}
 			}
 
-			       if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+					   if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 				       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: error in MkdirAll: " + err.Error()})
 				       select {
 				       case errCh <- err:
 				       default:
 				       }
-				       return
+							   emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: goroutine returning after MkdirAll error"})
+							   return
 			       }
 
 
 			// Check if we can skip
 			       alreadyOK, reason, err := skipCheck()
-			       if err != nil {
+					   if err != nil {
 				       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: error in skipCheck: " + err.Error()})
 				       select {
 				       case errCh <- err:
 				       default:
 				       }
-				       return
+							   emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: goroutine returning after skipCheck error"})
+							   return
 			       }
-			       if alreadyOK {
+					   if alreadyOK {
 				       if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
 					       emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
 					       atomic.AddInt64(&skippedCount, 1)
@@ -336,7 +346,8 @@ LOOP:
 				       }
 				       // Always emit debug log for skip, even if already loaded
 				       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: file skipped due to size match (" + reason + ")"})
-				       return
+							   emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: goroutine returning after skip (size match)"})
+							   return
 			       }
 
 					   emit(ProgressEvent{Event: "file_start", Path: finalRel, Total: it.Size})
@@ -353,13 +364,15 @@ LOOP:
 			       } else {
 				       dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
 			       }
-			       if dlErr != nil {
+					   if dlErr != nil {
 				       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: error in download: " + dlErr.Error()})
 				       select {
 				       case errCh <- fmt.Errorf("download %s: %w", finalRel, dlErr):
 				       default:
 				       }
-				       return
+							   emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: goroutine returning after download error"})
+							   return
+					emit(ProgressEvent{Event: "debug", Message: "debug: main file loop exited (canceled or completed)"})
 			       }
 
 			// Verify after download
