@@ -329,6 +329,8 @@ LOOP:
 						manifestMu.Unlock()
 					}
 				}
+                // Always emit debug log for skip, even if already loaded
+                emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: file skipped due to size match (" + reason + ")"})
 				return
 			}
 
