@@ -85,11 +85,17 @@
       };
 
       state.ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          handleWSMessage(msg);
-        } catch (e) {
-          console.error('WS parse error:', e);
+        const payload = typeof event.data === 'string' ? event.data : '';
+        const chunks = payload.split('\n').map((s) => s.trim()).filter(Boolean);
+        if (!chunks.length) return;
+
+        for (const chunk of chunks) {
+          try {
+            const msg = JSON.parse(chunk);
+            handleWSMessage(msg);
+          } catch (e) {
+            console.error('WS parse error:', e, chunk.slice(0, 200));
+          }
         }
       };
 

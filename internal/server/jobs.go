@@ -584,6 +584,8 @@ func (m *JobManager) runJob(job *Job) {
 		Event:   "job_started",
 		Message: fmt.Sprintf("Starting download mode=%s output=%s cache=%s", job.StorageMode, settings.OutputDir, settings.CacheDir),
 	})
+	lastProgressLogAt := make(map[string]time.Time)
+	lastProgressBytes := make(map[string]int64)
 
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners
 	progressFunc := func(evt hfdownloader.ProgressEvent) {
@@ -608,6 +610,28 @@ func (m *JobManager) runJob(job *Job) {
 				Path:    evt.Path,
 				Message: evt.Event + ": " + evt.Path,
 			})
+		case "file_progress":
+			now := time.Now()
+			lastAt, seenAt := lastProgressLogAt[evt.Path]
+			lastBytes, seenBytes := lastProgressBytes[evt.Path]
+			shouldLog := !seenAt || now.Sub(lastAt) >= 10*time.Second
+			if shouldLog {
+				delta := evt.Downloaded - lastBytes
+				if !seenBytes {
+					delta = evt.Downloaded
+				}
+				m.addDebugLog(DebugLogEntry{
+					Level:  "debug",
+					Source: "downloader",
+					JobID:  job.ID,
+					Repo:   job.Repo,
+					Event:  evt.Event,
+					Path:   evt.Path,
+					Message: fmt.Sprintf("progress %s: %d/%d bytes (+%d since last log)", evt.Path, evt.Downloaded, evt.Total, delta),
+				})
+				lastProgressLogAt[evt.Path] = now
+				lastProgressBytes[evt.Path] = evt.Downloaded
+			}
 		}
 
 		m.mu.Lock()
