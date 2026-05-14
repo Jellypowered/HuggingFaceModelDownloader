@@ -590,6 +590,16 @@ func (m *JobManager) runJob(job *Job) {
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners
 	progressFunc := func(evt hfdownloader.ProgressEvent) {
 		switch evt.Event {
+		case "debug":
+			m.addDebugLog(DebugLogEntry{
+				Level:   "debug",
+				Source:  "downloader",
+				JobID:   job.ID,
+				Repo:    job.Repo,
+				Event:   evt.Event,
+				Path:    evt.Path,
+				Message: evt.Message,
+			})
 		case "retry":
 			m.addDebugLog(DebugLogEntry{
 				Level:   "warn",
