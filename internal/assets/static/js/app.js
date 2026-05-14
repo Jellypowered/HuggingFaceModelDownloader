@@ -12,6 +12,8 @@
   const state = {
     jobs: new Map(),
     settings: {},
+    debugLogs: [],
+    debugAutoScroll: true,
     wsConnected: false,
     ws: null,
     currentPage: 'analyze'
@@ -52,6 +54,7 @@
     // Load page data
     if (page === 'cache') loadCache();
     if (page === 'jobs') loadJobs();
+    if (page === 'debug') renderDebugLogs();
     if (page === 'settings') loadSettings();
     if (page === 'mirror') loadMirrorTargets();
   }
@@ -70,11 +73,13 @@
       state.ws.onopen = () => {
         state.wsConnected = true;
         updateConnectionStatus(true);
+        console.info('WS connected');
       };
 
       state.ws.onclose = () => {
         state.wsConnected = false;
         updateConnectionStatus(false);
+        console.warn('WS disconnected; reconnecting in 3 seconds');
         // Reconnect after 3 seconds
         setTimeout(initWebSocket, 3000);
       };
@@ -114,13 +119,18 @@
     if (msg.type === 'init') {
       // Initial state with all jobs
       const jobs = msg.data?.jobs || [];
+      const debugLogs = msg.data?.debugLogs || [];
       state.jobs.clear();
       jobs.forEach(job => {
         state.jobs.set(job.id, job);
       });
+      state.debugLogs = debugLogs.slice(-2000);
       updateJobsBadge();
       if (state.currentPage === 'jobs') {
         renderJobs();
+      }
+      if (state.currentPage === 'debug') {
+        renderDebugLogs();
       }
     } else if (msg.type === 'job_update') {
       // Job update - data contains the full job object
@@ -132,6 +142,8 @@
           renderJobs();
         }
       }
+    } else if (msg.type === 'debug_log') {
+      appendDebugLog(msg.data);
     }
   }
 
@@ -1143,6 +1155,144 @@
       showToast(`Failed to dismiss: ${e.message}`, 'error');
     }
   };
+
+  // =========================================
+  // Debug Logs Page
+  // =========================================
+
+  const maxClientDebugLogs = 2000;
+  let consoleBridgeInstalled = false;
+
+  function normalizeDebugLog(entry) {
+    return {
+      time: entry?.time || new Date().toISOString(),
+      level: (entry?.level || 'debug').toLowerCase(),
+      source: entry?.source || 'frontend',
+      jobId: entry?.jobId || '',
+      repo: entry?.repo || '',
+      event: entry?.event || '',
+      path: entry?.path || '',
+      message: entry?.message || ''
+    };
+  }
+
+  function appendDebugLog(entry) {
+    const normalized = normalizeDebugLog(entry);
+    state.debugLogs.push(normalized);
+    if (state.debugLogs.length > maxClientDebugLogs) {
+      state.debugLogs = state.debugLogs.slice(-maxClientDebugLogs);
+    }
+    if (state.currentPage === 'debug') {
+      renderDebugLogs();
+    }
+  }
+
+  function debugLevelClass(level) {
+    if (level === 'error') return 'debug-error';
+    if (level === 'warn' || level === 'warning') return 'debug-warn';
+    if (level === 'info') return 'debug-info';
+    return 'debug-debug';
+  }
+
+  function renderDebugLogs() {
+    const container = $('#debugLogsList');
+    if (!container) return;
+
+    if (!state.debugLogs.length) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64">
+              <path d="M9 18h6"/><path d="M10 22h4"/>
+              <path d="M12 2a7 7 0 0 0-4 12.74V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.26A7 7 0 0 0 12 2z"/>
+            </svg>
+          </div>
+          <h3>No Debug Events Yet</h3>
+          <p>Logs from downloader retries, failures, websocket issues, and frontend errors will appear here.</p>
+        </div>
+      `;
+      return;
+    }
+
+    container.innerHTML = state.debugLogs.map((e) => {
+      const ts = new Date(e.time).toLocaleTimeString();
+      const tags = [
+        e.source ? `<span class="debug-tag">${escapeHtml(e.source)}</span>` : '',
+        e.event ? `<span class="debug-tag">${escapeHtml(e.event)}</span>` : '',
+        e.repo ? `<span class="debug-tag">${escapeHtml(e.repo)}</span>` : '',
+        e.jobId ? `<span class="debug-tag">job:${escapeHtml(e.jobId)}</span>` : '',
+        e.path ? `<span class="debug-tag">${escapeHtml(e.path)}</span>` : ''
+      ].filter(Boolean).join('');
+
+      return `
+        <div class="debug-log-row ${debugLevelClass(e.level)}">
+          <div class="debug-log-meta">
+            <span class="debug-time">${escapeHtml(ts)}</span>
+            <span class="debug-level">${escapeHtml((e.level || 'debug').toUpperCase())}</span>
+            ${tags}
+          </div>
+          <div class="debug-log-message">${escapeHtml(e.message || '')}</div>
+        </div>
+      `;
+    }).join('');
+
+    if (state.debugAutoScroll) {
+      container.scrollTop = container.scrollHeight;
+    }
+  }
+
+  function initDebugPage() {
+    $('#clearDebugLogsBtn')?.addEventListener('click', () => {
+      state.debugLogs = [];
+      renderDebugLogs();
+    });
+
+    $('#debugAutoScrollBtn')?.addEventListener('click', () => {
+      state.debugAutoScroll = !state.debugAutoScroll;
+      const btn = $('#debugAutoScrollBtn');
+      if (btn) {
+        btn.textContent = `Auto-scroll: ${state.debugAutoScroll ? 'On' : 'Off'}`;
+      }
+      if (state.debugAutoScroll) {
+        renderDebugLogs();
+      }
+    });
+  }
+
+  function initConsoleBridge() {
+    if (consoleBridgeInstalled) return;
+    consoleBridgeInstalled = true;
+
+    const nativeConsole = {
+      debug: console.debug.bind(console),
+      info: console.info.bind(console),
+      warn: console.warn.bind(console),
+      error: console.error.bind(console)
+    };
+
+    function argsToMessage(args) {
+      return args.map((a) => {
+        if (typeof a === 'string') return a;
+        try {
+          return JSON.stringify(a);
+        } catch (_e) {
+          return String(a);
+        }
+      }).join(' ');
+    }
+
+    ['debug', 'info', 'warn', 'error'].forEach((level) => {
+      console[level] = (...args) => {
+        nativeConsole[level](...args);
+        appendDebugLog({
+          level,
+          source: 'frontend',
+          event: 'console',
+          message: argsToMessage(args)
+        });
+      };
+    });
+  }
 
   // =========================================
   // Cache Page
@@ -2728,10 +2878,12 @@
   // =========================================
 
   function init() {
+    initConsoleBridge();
     initNavigation();
     initWebSocket();
     initAnalyzePage();
     initDownloadPage();
+    initDebugPage();
     initCachePage();
     initSettingsPage();
     initMirrorPage();

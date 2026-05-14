@@ -156,11 +156,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // sendInitialState sends current job state to newly connected client.
 func (s *Server) sendInitialState(client *WSClient) {
 	jobs := s.jobs.ListJobs()
+	debugLogs := s.jobs.GetDebugLogs()
 	
 	msg := WSMessage{
 		Type: "init",
 		Data: map[string]any{
 			"jobs":    jobs,
+			"debugLogs": debugLogs,
 			"version": "3.0.4",
 		},
 	}

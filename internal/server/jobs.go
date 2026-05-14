@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"sync"
 	"time"
 
@@ -64,6 +65,18 @@ type JobFileProgress struct {
 	Status     string `json:"status"` // pending, active, complete, skipped, error
 }
 
+// DebugLogEntry represents a timestamped debug event streamed to the UI.
+type DebugLogEntry struct {
+	Time    time.Time `json:"time"`
+	Level   string    `json:"level"`
+	Source  string    `json:"source"`
+	JobID   string    `json:"jobId,omitempty"`
+	Repo    string    `json:"repo,omitempty"`
+	Event   string    `json:"event,omitempty"`
+	Path    string    `json:"path,omitempty"`
+	Message string    `json:"message"`
+}
+
 // JobManager manages download jobs.
 type JobManager struct {
 	mu          sync.RWMutex
@@ -79,7 +92,12 @@ type JobManager struct {
 	// can race a still-in-flight mkdir inside the downloader and fail
 	// with "directory not empty".
 	runWG sync.WaitGroup
+
+	debugMu   sync.Mutex
+	debugLogs []DebugLogEntry
 }
+
+const maxDebugLogs = 2000
 
 // wsBroadcastMinGap is the minimum interval between consecutive WebSocket
 // broadcasts for the same job. Progress events arriving inside this window
@@ -94,6 +112,7 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 		jobs:   make(map[string]*Job),
 		config: cfg,
 		wsHub:  wsHub,
+		debugLogs: make([]DebugLogEntry, 0, 256),
 	}
 	if wsHub != nil {
 		m.wsCoalescer = newJobCoalescer(wsBroadcastMinGap, func(j *Job) {
@@ -101,6 +120,29 @@ func NewJobManager(cfg Config, wsHub *WSHub) *JobManager {
 		})
 	}
 	return m
+}
+
+func (m *JobManager) addDebugLog(entry DebugLogEntry) {
+	if entry.Time.IsZero() {
+		entry.Time = time.Now().UTC()
+	}
+	m.debugMu.Lock()
+	m.debugLogs = append(m.debugLogs, entry)
+	if len(m.debugLogs) > maxDebugLogs {
+		m.debugLogs = m.debugLogs[len(m.debugLogs)-maxDebugLogs:]
+	}
+	m.debugMu.Unlock()
+	if m.wsHub != nil {
+		m.wsHub.Broadcast("debug_log", entry)
+	}
+}
+
+func (m *JobManager) GetDebugLogs() []DebugLogEntry {
+	m.debugMu.Lock()
+	defer m.debugMu.Unlock()
+	out := make([]DebugLogEntry, len(m.debugLogs))
+	copy(out, m.debugLogs)
+	return out
 }
 
 // generateID creates a short random ID.
@@ -210,6 +252,14 @@ func (m *JobManager) CreateJob(req DownloadRequest) (*Job, bool, error) {
 	m.jobs[job.ID] = job
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
+	m.addDebugLog(DebugLogEntry{
+		Level:   "info",
+		Source:  "server",
+		JobID:   job.ID,
+		Repo:    job.Repo,
+		Event:   "job_created",
+		Message: fmt.Sprintf("Created job (%s) mode=%s revision=%s", map[bool]string{true: "dataset", false: "model"}[job.IsDataset], job.StorageMode, job.Revision),
+	})
 
 	// Start the job
 	m.runWG.Add(1)
@@ -267,6 +317,7 @@ func (m *JobManager) CancelJob(id string) bool {
 	job.EndedAt = &now
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
+	m.addDebugLog(DebugLogEntry{Level: "warn", Source: "server", JobID: job.ID, Repo: job.Repo, Event: "job_cancel", Message: "Cancel requested"})
 
 	m.notifyListeners(snapshot)
 	return true
@@ -292,6 +343,7 @@ func (m *JobManager) PauseJob(id string) bool {
 	job.Status = JobStatusPaused
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
+	m.addDebugLog(DebugLogEntry{Level: "warn", Source: "server", JobID: job.ID, Repo: job.Repo, Event: "job_pause", Message: "Pause requested"})
 
 	m.notifyListeners(snapshot)
 	return true
@@ -319,6 +371,7 @@ func (m *JobManager) ResumeJob(id string) bool {
 	job.Files = nil
 	snapshot := m.cloneJobLocked(job)
 	m.mu.Unlock()
+	m.addDebugLog(DebugLogEntry{Level: "info", Source: "server", JobID: job.ID, Repo: job.Repo, Event: "job_resume", Message: "Resume requested"})
 
 	// Notify listeners of status change
 	m.notifyListeners(snapshot)
@@ -345,6 +398,7 @@ func (m *JobManager) DeleteJob(id string) bool {
 		job.cancel()
 	}
 
+	m.addDebugLog(DebugLogEntry{Level: "info", Source: "server", JobID: job.ID, Repo: job.Repo, Event: "job_delete", Message: "Deleted from job list"})
 	delete(m.jobs, id)
 	return true
 }
@@ -406,6 +460,7 @@ func (m *JobManager) DismissJobResult(id string) (DismissJobResult, *Job) {
 	if !isTerminalJobStatus(job.Status) {
 		return DismissJobStillActive, job
 	}
+	m.addDebugLog(DebugLogEntry{Level: "info", Source: "server", JobID: job.ID, Repo: job.Repo, Event: "job_dismiss", Message: "Dismissed from UI list"})
 	delete(m.jobs, id)
 	return DismissJobOK, job
 }
@@ -521,8 +576,40 @@ func (m *JobManager) runJob(job *Job) {
 		settings.CacheDir = cacheDir
 	}
 
+	m.addDebugLog(DebugLogEntry{
+		Level:   "info",
+		Source:  "downloader",
+		JobID:   job.ID,
+		Repo:    job.Repo,
+		Event:   "job_started",
+		Message: fmt.Sprintf("Starting download mode=%s output=%s cache=%s", job.StorageMode, settings.OutputDir, settings.CacheDir),
+	})
+
 	// Progress callback - NOTE: must not hold lock when calling notifyListeners
 	progressFunc := func(evt hfdownloader.ProgressEvent) {
+		switch evt.Event {
+		case "retry":
+			m.addDebugLog(DebugLogEntry{
+				Level:   "warn",
+				Source:  "downloader",
+				JobID:   job.ID,
+				Repo:    job.Repo,
+				Event:   evt.Event,
+				Path:    evt.Path,
+				Message: fmt.Sprintf("Retry #%d for %s: %s", evt.Attempt, evt.Path, evt.Message),
+			})
+		case "file_start", "file_done":
+			m.addDebugLog(DebugLogEntry{
+				Level:   "debug",
+				Source:  "downloader",
+				JobID:   job.ID,
+				Repo:    job.Repo,
+				Event:   evt.Event,
+				Path:    evt.Path,
+				Message: evt.Event + ": " + evt.Path,
+			})
+		}
+
 		m.mu.Lock()
 
 		switch evt.Event {
@@ -593,16 +680,21 @@ func (m *JobManager) runJob(job *Job) {
 	}
 	endTime := time.Now()
 	job.EndedAt = &endTime
+	var endLog DebugLogEntry
 	if ctx.Err() != nil {
 		job.Status = JobStatusCancelled
+		endLog = DebugLogEntry{Level: "warn", Source: "downloader", JobID: job.ID, Repo: job.Repo, Event: "job_cancelled", Message: "Download cancelled by context"}
 	} else if err != nil {
 		job.Status = JobStatusFailed
 		job.Error = err.Error()
+		endLog = DebugLogEntry{Level: "error", Source: "downloader", JobID: job.ID, Repo: job.Repo, Event: "job_failed", Message: err.Error()}
 	} else {
 		job.Status = JobStatusCompleted
+		endLog = DebugLogEntry{Level: "info", Source: "downloader", JobID: job.ID, Repo: job.Repo, Event: "job_completed", Message: "Download completed"}
 	}
 	endSnap := m.cloneJobLocked(job)
 	m.mu.Unlock()
+	m.addDebugLog(endLog)
 
 	m.notifyListeners(endSnap)
 }
