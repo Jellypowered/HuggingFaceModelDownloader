@@ -208,7 +208,7 @@ func Download(ctx context.Context, job Job, cfg Settings, progress ProgressFunc)
 	}
 
 LOOP:
-	for _, item := range plan.Items {
+	for idx, item := range plan.Items {
 		// Stop scheduling more work once canceled
 		select {
 		case <-ctx.Done():
@@ -226,7 +226,9 @@ LOOP:
 		}
 
 		wg.Add(1)
-		go func() {
+			   go func() {
+								   // Emit debug log at the start of each file processing
+								   emit(ProgressEvent{Event: "debug", Path: it.RelativePath, Message: "debug: starting file processing (index=" + fmt.Sprint(idx) + ", name=" + it.RelativePath + ")"})
 			defer wg.Done()
 			defer func() { <-lim }()
 
@@ -241,17 +243,18 @@ LOOP:
 				finalRel = filepath.ToSlash(filepath.Join(it.Subdir, it.RelativePath))
 			}
 
-			if !useHFCache && cfg.NoRepoSubdir {
-				mappedRel, skip := mapFlatNoRepoFile(job.Repo, finalRel)
-				if skip {
-					if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
-						emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (ignored in flat mode)"})
-						atomic.AddInt64(&skippedCount, 1)
-					}
-					return
-				}
-				finalRel = mappedRel
-			}
+			       if !useHFCache && cfg.NoRepoSubdir {
+				       mappedRel, skip := mapFlatNoRepoFile(job.Repo, finalRel)
+				       if skip {
+					       if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
+						       emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (ignored in flat mode)"})
+						       atomic.AddInt64(&skippedCount, 1)
+					       }
+					       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: file skipped (ignored in flat mode)"})
+					       return
+				       }
+				       finalRel = mappedRel
+			       }
 
 			var dst string
 			var skipCheck func() (bool, string, error)
@@ -296,64 +299,68 @@ LOOP:
 				}
 			}
 
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
+			       if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: error in MkdirAll: " + err.Error()})
+				       select {
+				       case errCh <- err:
+				       default:
+				       }
+				       return
+			       }
 
 
 			// Check if we can skip
-			alreadyOK, reason, err := skipCheck()
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-			if alreadyOK {
-				if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
-					emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
-					atomic.AddInt64(&skippedCount, 1)
-					// Add to manifest (skipped files are still part of the download job)
-					if manifestBuilder != nil && (useHFCache || !cfg.NoRepoSubdir) {
-						manifestName := it.RelativePath
-						if !useHFCache {
-							manifestName = finalRel
-						}
-						manifestMu.Lock()
-						manifestBuilder.AddFile(manifestName, it.SHA256, it.Size, it.LFS)
-						manifestMu.Unlock()
-					}
-				}
-                // Always emit debug log for skip, even if already loaded
-                emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: file skipped due to size match (" + reason + ")"})
-				return
-			}
+			       alreadyOK, reason, err := skipCheck()
+			       if err != nil {
+				       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: error in skipCheck: " + err.Error()})
+				       select {
+				       case errCh <- err:
+				       default:
+				       }
+				       return
+			       }
+			       if alreadyOK {
+				       if _, loaded := skipOnce.LoadOrStore(finalRel, struct{}{}); !loaded {
+					       emit(ProgressEvent{Event: "file_done", Path: finalRel, Message: "skip (" + reason + ")"})
+					       atomic.AddInt64(&skippedCount, 1)
+					       // Add to manifest (skipped files are still part of the download job)
+					       if manifestBuilder != nil && (useHFCache || !cfg.NoRepoSubdir) {
+						       manifestName := it.RelativePath
+						       if !useHFCache {
+							       manifestName = finalRel
+						       }
+						       manifestMu.Lock()
+						       manifestBuilder.AddFile(manifestName, it.SHA256, it.Size, it.LFS)
+						       manifestMu.Unlock()
+					       }
+				       }
+				       // Always emit debug log for skip, even if already loaded
+				       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: file skipped due to size match (" + reason + ")"})
+				       return
+			       }
 
-			emit(ProgressEvent{Event: "file_start", Path: finalRel, Total: it.Size})
+					   emit(ProgressEvent{Event: "file_start", Path: finalRel, Total: it.Size})
+					   emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: file_start event emitted"})
 
 			// Create a copy with updated RelativePath for progress display
 			itForIO := it
 			itForIO.RelativePath = finalRel
 
 			// Choose single/multipart path
-			var dlErr error
-			if it.Size >= thresholdBytes && it.AcceptRanges {
-				dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
-			} else {
-				dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
-			}
-			if dlErr != nil {
-				select {
-				case errCh <- fmt.Errorf("download %s: %w", finalRel, dlErr):
-				default:
-				}
-				return
-			}
+			       var dlErr error
+			       if it.Size >= thresholdBytes && it.AcceptRanges {
+				       dlErr = downloadMultipart(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+			       } else {
+				       dlErr = downloadSingle(fileCtx, httpc, cfg.Token, job, cfg, itForIO, dst, emit)
+			       }
+			       if dlErr != nil {
+				       emit(ProgressEvent{Event: "debug", Path: finalRel, Message: "debug: error in download: " + dlErr.Error()})
+				       select {
+				       case errCh <- fmt.Errorf("download %s: %w", finalRel, dlErr):
+				       default:
+				       }
+				       return
+			       }
 
 			// Verify after download
 			if it.LFS && it.SHA256 != "" {
