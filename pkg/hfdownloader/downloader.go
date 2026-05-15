@@ -554,6 +554,20 @@ func mapFlatNoRepoFile(repo, rel string) (string, bool) {
 	return rel, false
 }
 
+// parseContentRange parses a Content-Range header of the form:
+// "bytes <start>-<end>/<total>" or "bytes <start>-<end>/*".
+func parseContentRange(h string) (start, end, total int64, ok bool) {
+	var unit string
+	total = -1
+	if _, err := fmt.Sscanf(strings.TrimSpace(h), "%s %d-%d/%d", &unit, &start, &end, &total); err == nil {
+		return start, end, total, strings.EqualFold(unit, "bytes") && start >= 0 && end >= start
+	}
+	if _, err := fmt.Sscanf(strings.TrimSpace(h), "%s %d-%d/*", &unit, &start, &end); err == nil {
+		return start, end, -1, strings.EqualFold(unit, "bytes") && start >= 0 && end >= start
+	}
+	return 0, 0, -1, false
+}
+
 // downloadSingle downloads a file in a single request.
 //
 // Resume behavior: if a .part file already exists from a previous interrupted
@@ -606,6 +620,7 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 
 		req, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
 		addAuth(req, token)
+		req.Header.Set("Accept-Encoding", "identity")
 		if pos > 0 {
 			if it.Size > 0 {
 				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", pos, it.Size-1))
@@ -635,11 +650,26 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				lastErr = fmt.Errorf("bad status: %s", resp.Status)
 				resp.Body.Close()
 			} else {
+				if pos > 0 && resp.StatusCode == http.StatusPartialContent {
+					start, _, _, ok := parseContentRange(resp.Header.Get("Content-Range"))
+					if !ok || start != pos {
+						lastErr = fmt.Errorf("invalid Content-Range for resume: %q (expected start %d)", resp.Header.Get("Content-Range"), pos)
+						resp.Body.Close()
+						goto single_retry
+					}
+				}
 				pr := newProgressReader(resp.Body, it.Size, it.RelativePath, emit)
 				pr.downloaded = pos // emitted progress reflects cumulative bytes
 				_, cerr := io.Copy(out, pr)
 				resp.Body.Close()
 				if cerr == nil {
+					if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
+						pos = cur
+					}
+					if it.Size > 0 && pos != it.Size {
+						lastErr = fmt.Errorf("incomplete download: got %d bytes, expected %d", pos, it.Size)
+						goto single_retry
+					}
 					out.Close()
 					return os.Rename(tmp, dst)
 				}
@@ -651,6 +681,8 @@ func downloadSingle(ctx context.Context, httpc *http.Client, token string, job J
 				}
 			}
 		}
+
+	single_retry:
 
 		if attempt < cfg.Retries {
 			emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
@@ -667,6 +699,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 	// HEAD to resolve size
 	req, _ := http.NewRequestWithContext(ctx, "HEAD", it.URL, nil)
 	addAuth(req, token)
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := httpc.Do(req)
 	if err != nil {
 		return err
@@ -771,6 +804,7 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 
 				rq, _ := http.NewRequestWithContext(ctx, "GET", it.URL, nil)
 				addAuth(rq, token)
+				rq.Header.Set("Accept-Encoding", "identity")
 				rq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+pos, end))
 
 				rs, err := httpc.Do(rq)
@@ -780,18 +814,29 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 					lastErr = fmt.Errorf("range not supported (status %s)", rs.Status)
 					rs.Body.Close()
 				} else {
+					rStart, rEnd, _, ok := parseContentRange(rs.Header.Get("Content-Range"))
+					expectStart := start + pos
+					if !ok || rStart != expectStart || rEnd != end {
+						lastErr = fmt.Errorf("invalid Content-Range for part %d: %q (expected bytes %d-%d)", i, rs.Header.Get("Content-Range"), expectStart, end)
+						rs.Body.Close()
+						goto part_retry
+					}
 					_, cerr := io.Copy(out, rs.Body)
 					rs.Body.Close()
-					if cerr == nil {
-						return
-					}
-					lastErr = cerr
-					// Advance pos by what we actually wrote so the next retry
-					// Range request picks up from the correct offset.
 					if cur, serr := out.Seek(0, io.SeekCurrent); serr == nil {
 						pos = cur
 					}
+					if cerr == nil {
+						if pos == expected {
+							return
+						}
+						lastErr = fmt.Errorf("incomplete part %d: got %d bytes, expected %d", i, pos, expected)
+					} else {
+						lastErr = cerr
+					}
 				}
+
+			part_retry:
 
 				if attempt < cfg.Retries {
 					emit(ProgressEvent{Event: "retry", Path: it.RelativePath, Attempt: attempt + 1, Message: lastErr.Error()})
@@ -889,6 +934,12 @@ func downloadMultipart(ctx context.Context, httpc *http.Client, token string, jo
 		in.Close()
 	}
 	out.Close()
+
+	if fi, err := os.Stat(dst + ".part"); err != nil {
+		return err
+	} else if fi.Size() != it.Size {
+		return fmt.Errorf("assembled size mismatch: got %d bytes, expected %d", fi.Size(), it.Size)
+	}
 
 	if err := os.Rename(dst+".part", dst); err != nil {
 		return err
